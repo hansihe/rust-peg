@@ -4,6 +4,9 @@
 extern crate quote;
 extern crate codemap;
 extern crate codemap_diagnostic;
+extern crate colored;
+extern crate cursive;
+extern crate cursive_tree_view;
 
 use std::io;
 use std::io::prelude::*;
@@ -16,20 +19,36 @@ use std::env;
 use codemap::{ CodeMap, Span };
 use codemap_diagnostic::{ Diagnostic, Level, SpanLabel, SpanStyle, Emitter, ColorConfig };
 
+use quote::Tokens;
+
 mod translate;
 mod grammar;
+pub mod forensics;
 
 struct PegCompiler {
     codemap: CodeMap,
+    log_events: bool,
     diagnostics: Vec<codemap_diagnostic::Diagnostic>
 }
 
 impl PegCompiler {
-    fn new() -> PegCompiler {
+    fn new(log_events: bool) -> PegCompiler {
         PegCompiler {
             codemap: CodeMap::new(),
+            log_events: log_events,
             diagnostics: vec![],
         }
+    }
+
+    fn if_trace<F>(&self, closure: F) -> Tokens where F: Fn() -> Tokens {
+        if self.log_events {
+            closure()
+        } else {
+            quote! {}
+        }
+    }
+    fn do_trace(&self) -> bool {
+        self.log_events
     }
 
     fn has_error(&self) -> bool {
@@ -86,11 +105,12 @@ impl PegCompiler {
             Ok(output_tokens?.to_string())
         }
     }
+
 }
 
 /// Compile a peg grammar to Rust source, printing errors to stderr
-pub fn compile(filename: String, input: String) -> Result<String, ()> {
-    let mut compiler = PegCompiler::new();
+pub fn compile(filename: String, input: String, log_events: bool) -> Result<String, ()> {
+    let mut compiler = PegCompiler::new(log_events);
     let result = compiler.compile(filename, input);
     compiler.print_diagnostics();
     result
@@ -98,7 +118,7 @@ pub fn compile(filename: String, input: String) -> Result<String, ()> {
 
 /// Compile the PEG grammar in the specified filename to cargo's OUT_DIR.
 /// Errors are emitted to stderr and terminate the process.
-pub fn cargo_build<T: AsRef<Path> + ?Sized>(input_path: &T) {
+pub fn cargo_build<T: AsRef<Path> + ?Sized>(input_path: &T, log_events: bool) {
     let mut stderr = io::stderr();
     let input_path = input_path.as_ref();
 
@@ -110,7 +130,7 @@ pub fn cargo_build<T: AsRef<Path> + ?Sized>(input_path: &T) {
 
     println!("cargo:rerun-if-changed={}", input_path.display());
 
-    let mut compiler = PegCompiler::new();
+    let mut compiler = PegCompiler::new(log_events);
     let result = compiler.compile(input_path.to_string_lossy().into_owned(), peg_source);
     compiler.print_diagnostics();
 

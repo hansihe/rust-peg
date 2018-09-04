@@ -17,6 +17,9 @@ readme = "README.md"
 quote = "0.3"
 codemap = "0.1"
 codemap-diagnostic = "0.1"
+colored = "1.6.1"
+cursive = "0.8"
+cursive_tree_view = "0.2"
 
 [[bin]]
 name = "rust-peg"

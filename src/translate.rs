@@ -294,7 +294,7 @@ static HELPERS: &'static str = stringify! {
 };
 
 pub(crate) fn compile_grammar(compiler: &mut PegCompiler, grammar: &Grammar) -> Result<Tokens, ()> {
-	let mut items = vec![make_parse_state(&grammar.rules)];
+	let mut items = vec![make_parse_state(compiler, &grammar.rules)];
 
 	for rule in &grammar.rules {
 		items.push(compile_rule(compiler, grammar, rule))
@@ -306,8 +306,18 @@ pub(crate) fn compile_grammar(compiler: &mut PegCompiler, grammar: &Grammar) -> 
 	let view_items: Vec<_> = grammar.imports.iter().map(|x| raw(x)).collect();
 	let helpers = raw(HELPERS);
 
+    let use_peg = if compiler.log_events {
+        quote! {
+            use ::peg::forensics;
+        }
+    } else {
+        quote! {}
+    };
+
 	Ok(quote! {
 		use self::RuleResult::{Matched, Failed};
+        #use_peg
+
 		#(#view_items)*
 
 		#helpers
@@ -316,7 +326,7 @@ pub(crate) fn compile_grammar(compiler: &mut PegCompiler, grammar: &Grammar) -> 
 	})
 }
 
-fn make_parse_state(rules: &[Rule]) -> Tokens {
+fn make_parse_state(compiler: &PegCompiler, rules: &[Rule]) -> Tokens {
 	let mut cache_fields_def: Vec<Tokens> = Vec::new();
 	let mut cache_fields: Vec<Tokens> = Vec::new();
 	for rule in rules {
@@ -328,6 +338,25 @@ fn make_parse_state(rules: &[Rule]) -> Tokens {
 		}
 	}
 
+    let event_list_field = compiler.if_trace(|| {
+        quote! { event_list: Vec<forensics::TraceEvent>, }
+    });
+    let event_list_init = compiler.if_trace(|| {
+        quote! { event_list: Vec::new(), }
+    });
+
+    let push_event = if compiler.do_trace() {
+        quote! {
+            fn push_trace_event(&mut self, event: forensics::TraceEvent) {
+                self.event_list.push(event);
+            }
+        }
+    } else {
+        quote! {
+            fn push_trace_event(&mut self, _event: forensics::TraceEvent) {}
+        }
+    };
+
 	quote! {
 		struct ParseState<'input> {
 			max_err_pos: usize,
@@ -335,6 +364,7 @@ fn make_parse_state(rules: &[Rule]) -> Tokens {
 			reparsing_on_error: bool,
 			expected: ::std::collections::HashSet<&'static str>,
 			_phantom: ::std::marker::PhantomData<&'input ()>,
+            #event_list_field
 			#(#cache_fields_def),*
 		}
 
@@ -346,9 +376,11 @@ fn make_parse_state(rules: &[Rule]) -> Tokens {
 					reparsing_on_error: false,
 					expected: ::std::collections::HashSet::new(),
 					_phantom: ::std::marker::PhantomData,
+                    #event_list_init
 					#(#cache_fields: ::std::collections::HashMap::new()),*
 				}
 			}
+            #push_event
 		}
 	}
 }
@@ -366,21 +398,37 @@ fn compile_rule(compiler: &mut PegCompiler, grammar: &Grammar, rule: &Rule) -> T
 
 	let body = compile_expr(compiler, context, &*rule.expr);
 
-	let wrapped_body = if cfg!(feature = "trace") {
-		quote!{{
+    let wrapped_body = if compiler.log_events {
+        quote! {{
 			let (line, col) = pos_to_line(__input, __pos);
-			println!("[PEG_TRACE] Attempting to match rule {} at {}:{} (pos {})", #rule_name, line, col, __pos);
-			let mut __peg_closure = || {
-				#body
-			};
-			let __peg_result = __peg_closure();
-			match __peg_result {
-				Matched(_, _) => println!("[PEG_TRACE] Matched rule {} at {}:{} (pos {})", #rule_name, line, col, __pos),
-				Failed => println!("[PEG_TRACE] Failed to match rule {} at {}:{} (pos {})", #rule_name, line, col, __pos)
-			}
+            __state.push_trace_event(forensics::TraceEvent::MatchStart {
+                rule_name: #rule_name,
+                start_pos: forensics::FilePos(__pos),
+            });
+
+			let __peg_result = {
+                let mut __peg_closure = || {
+                    #body
+                };
+                __peg_closure()
+            };
+
+            let end_pos_option = if let Matched(end_pos, _) = __peg_result {
+                Some(forensics::FilePos(end_pos))
+            } else {
+                None
+            };
+            __state.push_trace_event(forensics::TraceEvent::MatchEnd {
+                rule_name: #rule_name,
+                start_pos: forensics::FilePos(__pos),
+                end_pos: end_pos_option,
+            });
+
 			__peg_result
-		}}
-	} else { body };
+        }}
+    } else {
+        body
+    };
 
 	let nl = raw("\n\n"); // make output slightly more readable
 	let extra_args_def = grammar.extra_args_def();
@@ -388,17 +436,28 @@ fn compile_rule(compiler: &mut PegCompiler, grammar: &Grammar, rule: &Rule) -> T
 	if rule.cached {
 		let cache_field = raw(&format!("{}_cache", rule.name));
 
-		let cache_trace = if cfg!(feature = "trace") {
-			quote!{
-				let (line, col) = pos_to_line(__input, __pos);
+        let cache_trace = if compiler.log_events {
+            quote! {
                 match entry {
-                    &Matched(..) => println!("[PEG_TRACE] Cached match of rule {} at {}:{} (pos {})", #rule_name, line, col, __pos),
-                    &Failed => println!("[PEG_TRACE] Cached fail of rule {} at {}:{} (pos {})", #rule_name, line, col, __pos),
+                    &Matched(end_pos, _) => {
+                        __state.push_trace_event(TraceEvent::CachedRule {
+                            rule_name: #rule_name,
+                            start_pos: forensics::FilePos(__pos),
+                            end_pos: Some(forensics::FilePos(end_pos)),
+                        });
+                    },
+                    &Failed => {
+                        __state.push_trace_event(TraceEvent::CachedRule {
+                            rule_name: #rule_name,
+                            start_pos: forensics::FilePos(__pos),
+                            end_pos: None,
+                        });
+                    },
                 };
-			}
-		} else {
-			quote!()
-		};
+            }
+        } else {
+            quote! {}
+        };
 
 		quote! { #nl
 			fn #name<'input>(__input: &'input str, __state: &mut ParseState<'input>, __pos: usize #extra_args_def) -> RuleResult<#ret_ty> {
@@ -432,13 +491,16 @@ fn compile_rule_export(grammar: &Grammar, rule: &Rule) -> Tokens {
 
 	quote! {
 		#nl
-		pub fn #name<'input>(__input: &'input str #extra_args_def) -> ParseResult<#ret_ty> {
+		pub fn #name<'input>(__input: &'input str #extra_args_def) -> (Vec<forensics::TraceEvent>, ParseResult<#ret_ty>) {
 			#![allow(non_snake_case, unused)]
 			let mut __state = ParseState::new();
 			match #parse_fn(__input, &mut __state, 0 #extra_args_call) {
 				Matched(__pos, __value) => {
 					if __pos == __input.len() {
-						return Ok(__value)
+                        return (
+                            __state.event_list, 
+                            Ok(__value)
+                        );
 					}
 				}
 				_ => ()
@@ -453,12 +515,15 @@ fn compile_rule_export(grammar: &Grammar, rule: &Rule) -> Tokens {
 
 			let (__line, __col) = pos_to_line(__input, __err_pos);
 
-			Err(ParseError {
-				line: __line,
-				column: __col,
-				offset: __err_pos,
-				expected: __state.expected,
-			})
+            (
+                __state.event_list, 
+                Err(ParseError {
+                    line: __line,
+                    column: __col,
+                    offset: __err_pos,
+                    expected: __state.expected,
+                })
+            )
 		}
 	}
 }
